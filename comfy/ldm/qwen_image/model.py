@@ -4,12 +4,176 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
 from einops import repeat
+import os
+import time
+import functools
+from collections import defaultdict
 
 from comfy.ldm.lightricks.model import TimestepEmbedding, Timesteps
 from comfy.ldm.modules.attention import optimized_attention_masked
 from comfy.ldm.flux.layers import EmbedND
 import comfy.ldm.common_dit
 import comfy.patcher_extension
+
+USE_TRITON_FUSION = os.environ.get("QWEN_USE_TRITON", "0") == "1"
+
+_timing_stats = defaultdict(lambda: {"times": [], "count": 0})
+
+def timing_decorator(func):
+    @functools.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        start_time = time.perf_counter()
+        result = func(self, *args, **kwargs)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        end_time = time.perf_counter()
+        elapsed_ms = (end_time - start_time) * 1000
+        
+        class_name = self.__class__.__name__
+        method_name = func.__name__
+        full_name = f"{class_name}.{method_name}"
+        
+        stats = _timing_stats[full_name]
+        stats["times"].append(elapsed_ms)
+        stats["count"] += 1
+        
+        if stats["count"] % 10 == 0:
+            times = stats["times"][-10:]
+            avg = sum(times) / len(times)
+            min_t = min(times)
+            max_t = max(times)
+            print(f"[TIMING] {full_name}: avg={avg:.3f}ms, min={min_t:.3f}ms, max={max_t:.3f}ms (last 10)")
+        
+        return result
+    return wrapper
+
+try:
+    import triton
+    import triton.language as tl
+    TRITON_AVAILABLE = True
+except ImportError:
+    TRITON_AVAILABLE = False
+    USE_TRITON_FUSION = False
+
+if TRITON_AVAILABLE and USE_TRITON_FUSION:
+    @triton.jit
+    def modulate_kernel(
+        x_ptr, mod_params_ptr, output_ptr, gate_ptr,
+        total_rows, hidden_dim,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        row_idx = tl.program_id(0)
+        
+        if row_idx >= total_rows:
+            return
+        
+        row_start = row_idx * hidden_dim
+        num_blocks = hidden_dim // BLOCK_SIZE
+        
+        for block_idx in range(num_blocks):
+            h_idx = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            base_offset = row_start + h_idx
+            
+            x = tl.load(x_ptr + base_offset)
+            shift = tl.load(mod_params_ptr + h_idx)
+            scale = tl.load(mod_params_ptr + hidden_dim + h_idx)
+            gate = tl.load(mod_params_ptr + 2 * hidden_dim + h_idx)
+            
+            scale_plus_1 = scale + 1.0
+            output = tl.fma(x, scale_plus_1, shift)
+            
+            tl.store(output_ptr + base_offset, output)
+            tl.store(gate_ptr + base_offset, gate)
+
+    @triton.jit
+    def fused_norm_modulate_kernel(
+        x_ptr, mod_params_ptr, output_ptr, gate_ptr,
+        total_rows, hidden_dim,
+        eps: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        row_idx = tl.program_id(0)
+        
+        if row_idx >= total_rows:
+            return
+        
+        row_start = row_idx * hidden_dim
+        num_blocks = hidden_dim // BLOCK_SIZE
+        hidden_dim_float = tl.cast(hidden_dim, tl.float32)
+        
+        mean_acc = 0.0
+        m2_acc = 0.0
+        
+        for block_idx in range(num_blocks):
+            h_idx = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            x_vals = tl.load(x_ptr + row_start + h_idx).to(tl.float32)
+            mean_acc += tl.sum(x_vals)
+            m2_acc += tl.sum(x_vals * x_vals)
+        
+        mean = mean_acc / hidden_dim_float
+        variance = m2_acc / hidden_dim_float - mean * mean
+        rstd = 1.0 / tl.sqrt(variance + eps)
+        
+        for block_idx in range(num_blocks):
+            h_idx = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            
+            x_vals = tl.load(x_ptr + row_start + h_idx).to(tl.float32)
+            shift = tl.load(mod_params_ptr + h_idx).to(tl.float32)
+            scale = tl.load(mod_params_ptr + hidden_dim + h_idx).to(tl.float32)
+            gate = tl.load(mod_params_ptr + 2 * hidden_dim + h_idx).to(tl.float32)
+            
+            x_normalized = tl.fma(x_vals - mean, rstd, 0.0)
+            output = tl.fma(x_normalized, scale + 1.0, shift)
+            
+            tl.store(output_ptr + row_start + h_idx, output.to(x_ptr.dtype.element_ty))
+            tl.store(gate_ptr + row_start + h_idx, gate.to(x_ptr.dtype.element_ty))
+
+    def triton_fused_norm_modulate(x, mod_params, norm_fn, eps=1e-6):
+        batch, seq_len, hidden_dim = x.shape
+        
+        x_2d = x.reshape(-1, hidden_dim).contiguous()
+        mod_params_2d = mod_params.reshape(-1, hidden_dim * 3).contiguous()
+        
+        output = torch.empty_like(x_2d)
+        gate = torch.empty_like(x_2d)
+        
+        total_rows = x_2d.shape[0]
+        
+        BLOCK_SIZE = 256 if hidden_dim % 256 == 0 else 128
+        grid = (total_rows,)
+        
+        fused_norm_modulate_kernel[grid](
+            x_2d, mod_params_2d, output, gate,
+            total_rows, hidden_dim,
+            eps=eps,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+        
+        return output.view(batch, seq_len, hidden_dim), gate.view(batch, seq_len, hidden_dim)
+
+    def triton_modulate(x, mod_params):
+        batch, seq_len, hidden_dim = x.shape
+        
+        x_2d = x.reshape(-1, hidden_dim).contiguous()
+        mod_params_2d = mod_params.reshape(-1, hidden_dim * 3).contiguous()
+        
+        output = torch.empty_like(x_2d)
+        gate = torch.empty_like(x_2d)
+        
+        total_rows = x_2d.shape[0]
+        
+        BLOCK_SIZE = 256 if hidden_dim % 256 == 0 else 128
+        grid = (total_rows,)
+        
+        modulate_kernel[grid](
+            x_2d, mod_params_2d, output, gate,
+            total_rows, hidden_dim,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+        
+        return output.view(batch, seq_len, hidden_dim), gate.view(batch, seq_len, hidden_dim)
 
 class GELU(nn.Module):
     def __init__(self, dim_in: int, dim_out: int, approximate: str = "none", bias: bool = True, dtype=None, device=None, operations=None):
@@ -217,9 +381,26 @@ class QwenImageTransformerBlock(nn.Module):
         )
 
     def _modulate(self, x: torch.Tensor, mod_params: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if USE_TRITON_FUSION and TRITON_AVAILABLE and x.is_cuda:
+            try:
+                return triton_modulate(x, mod_params)
+            except Exception as e:
+                print(f"[TRITON] modulate failed: {e}, falling back to PyTorch")
+        
         shift, scale, gate = torch.chunk(mod_params, 3, dim=-1)
         return torch.addcmul(shift.unsqueeze(1), x, 1 + scale.unsqueeze(1)), gate.unsqueeze(1)
 
+    def _fused_norm_modulate(self, x: torch.Tensor, mod_params: torch.Tensor, norm_fn) -> Tuple[torch.Tensor, torch.Tensor]:
+        if USE_TRITON_FUSION and TRITON_AVAILABLE and x.is_cuda:
+            try:
+                return triton_fused_norm_modulate(x, mod_params, norm_fn, eps=1e-6)
+            except Exception as e:
+                print(f"[TRITON] fused_norm_modulate failed: {e}, falling back to PyTorch")
+        
+        x_normed = norm_fn(x)
+        return self._modulate(x_normed, mod_params)
+
+    @timing_decorator
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -234,10 +415,20 @@ class QwenImageTransformerBlock(nn.Module):
         img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)
         txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)
 
-        img_normed = self.img_norm1(hidden_states)
-        img_modulated, img_gate1 = self._modulate(img_normed, img_mod1)
-        txt_normed = self.txt_norm1(encoder_hidden_states)
-        txt_modulated, txt_gate1 = self._modulate(txt_normed, txt_mod1)
+        if USE_TRITON_FUSION and TRITON_AVAILABLE and hidden_states.is_cuda:
+            try:
+                img_modulated, img_gate1 = self._fused_norm_modulate(hidden_states, img_mod1, self.img_norm1)
+                txt_modulated, txt_gate1 = self._fused_norm_modulate(encoder_hidden_states, txt_mod1, self.txt_norm1)
+            except:
+                img_normed = self.img_norm1(hidden_states)
+                img_modulated, img_gate1 = self._modulate(img_normed, img_mod1)
+                txt_normed = self.txt_norm1(encoder_hidden_states)
+                txt_modulated, txt_gate1 = self._modulate(txt_normed, txt_mod1)
+        else:
+            img_normed = self.img_norm1(hidden_states)
+            img_modulated, img_gate1 = self._modulate(img_normed, img_mod1)
+            txt_normed = self.txt_norm1(encoder_hidden_states)
+            txt_modulated, txt_gate1 = self._modulate(txt_normed, txt_mod1)
 
         img_attn_output, txt_attn_output = self.attn(
             hidden_states=img_modulated,
@@ -250,13 +441,26 @@ class QwenImageTransformerBlock(nn.Module):
         hidden_states = hidden_states + img_gate1 * img_attn_output
         encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
 
-        img_normed2 = self.img_norm2(hidden_states)
-        img_modulated2, img_gate2 = self._modulate(img_normed2, img_mod2)
-        hidden_states = torch.addcmul(hidden_states, img_gate2, self.img_mlp(img_modulated2))
-
-        txt_normed2 = self.txt_norm2(encoder_hidden_states)
-        txt_modulated2, txt_gate2 = self._modulate(txt_normed2, txt_mod2)
-        encoder_hidden_states = torch.addcmul(encoder_hidden_states, txt_gate2, self.txt_mlp(txt_modulated2))
+        if USE_TRITON_FUSION and TRITON_AVAILABLE and hidden_states.is_cuda:
+            try:
+                img_modulated2, img_gate2 = self._fused_norm_modulate(hidden_states, img_mod2, self.img_norm2)
+                hidden_states = torch.addcmul(hidden_states, img_gate2, self.img_mlp(img_modulated2))
+                txt_modulated2, txt_gate2 = self._fused_norm_modulate(encoder_hidden_states, txt_mod2, self.txt_norm2)
+                encoder_hidden_states = torch.addcmul(encoder_hidden_states, txt_gate2, self.txt_mlp(txt_modulated2))
+            except:
+                img_normed2 = self.img_norm2(hidden_states)
+                img_modulated2, img_gate2 = self._modulate(img_normed2, img_mod2)
+                hidden_states = torch.addcmul(hidden_states, img_gate2, self.img_mlp(img_modulated2))
+                txt_normed2 = self.txt_norm2(encoder_hidden_states)
+                txt_modulated2, txt_gate2 = self._modulate(txt_normed2, txt_mod2)
+                encoder_hidden_states = torch.addcmul(encoder_hidden_states, txt_gate2, self.txt_mlp(txt_modulated2))
+        else:
+            img_normed2 = self.img_norm2(hidden_states)
+            img_modulated2, img_gate2 = self._modulate(img_normed2, img_mod2)
+            hidden_states = torch.addcmul(hidden_states, img_gate2, self.img_mlp(img_modulated2))
+            txt_normed2 = self.txt_norm2(encoder_hidden_states)
+            txt_modulated2, txt_gate2 = self._modulate(txt_normed2, txt_mod2)
+            encoder_hidden_states = torch.addcmul(encoder_hidden_states, txt_gate2, self.txt_mlp(txt_modulated2))
 
         return encoder_hidden_states, hidden_states
 
