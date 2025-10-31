@@ -5,9 +5,6 @@ import torch.nn.functional as F
 from typing import Optional, Tuple
 from einops import repeat
 import os
-import time
-import functools
-from collections import defaultdict
 
 from comfy.ldm.lightricks.model import TimestepEmbedding, Timesteps
 from comfy.ldm.modules.attention import optimized_attention_masked
@@ -16,38 +13,7 @@ import comfy.ldm.common_dit
 import comfy.patcher_extension
 
 USE_TRITON_FUSION = os.environ.get("QWEN_USE_TRITON", "0") == "1"
-
-_timing_stats = defaultdict(lambda: {"times": [], "count": 0})
-
-def timing_decorator(func):
-    @functools.wraps(func)
-    def wrapper(self, *args, **kwargs):
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        start_time = time.perf_counter()
-        result = func(self, *args, **kwargs)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        end_time = time.perf_counter()
-        elapsed_ms = (end_time - start_time) * 1000
-        
-        class_name = self.__class__.__name__
-        method_name = func.__name__
-        full_name = f"{class_name}.{method_name}"
-        
-        stats = _timing_stats[full_name]
-        stats["times"].append(elapsed_ms)
-        stats["count"] += 1
-        
-        if stats["count"] % 10 == 0:
-            times = stats["times"][-10:]
-            avg = sum(times) / len(times)
-            min_t = min(times)
-            max_t = max(times)
-            print(f"[TIMING] {full_name}: avg={avg:.3f}ms, min={min_t:.3f}ms, max={max_t:.3f}ms (last 10)")
-        
-        return result
-    return wrapper
+USE_PROFILER = os.environ.get("QWEN_USE_PROFILER", "0") == "1"
 
 try:
     import triton
@@ -58,6 +24,75 @@ except ImportError:
     USE_TRITON_FUSION = False
 
 if TRITON_AVAILABLE and USE_TRITON_FUSION:
+    @triton.autotune(
+        configs=[
+            triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=3, num_warps=8),
+            triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=5, num_warps=2),
+            triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=5, num_warps=2),
+            triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 64}, num_stages=5, num_warps=2),
+            triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 64}, num_stages=5, num_warps=2),
+        ],
+        key=['M', 'N', 'K'],
+    )
+    @triton.jit
+    def fused_linear_gelu_kernel(
+        x_ptr, weight_ptr, bias_ptr, output_ptr,
+        M, K, N,
+        stride_xm, stride_xk,
+        stride_wn, stride_wk,
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+        USE_TANH_APPROX: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_k = tl.arange(0, BLOCK_K)
+        
+        mask_m = offs_m < M
+        mask_n = offs_n < N
+        
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        
+        for k in range(0, K, BLOCK_K):
+            mask_k = (k + offs_k) < K
+            
+            x_ptrs = x_ptr + offs_m[:, None] * stride_xm + (k + offs_k[None, :]) * stride_xk
+            x_tile = tl.load(x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
+            
+            w_ptrs = weight_ptr + offs_n[:, None] * stride_wn + (k + offs_k[None, :]) * stride_wk
+            w_tile = tl.load(w_ptrs, mask=mask_n[:, None] & mask_k[None, :], other=0.0)
+            
+            acc += tl.dot(x_tile, tl.trans(w_tile))
+        
+        bias_ptrs = bias_ptr + offs_n
+        bias_tile = tl.load(bias_ptrs, mask=mask_n, other=0.0)
+        acc = acc + bias_tile[None, :]
+        
+        if USE_TANH_APPROX:
+            sqrt_2_over_pi = 0.7978845608028654
+            acc_cubed = acc * acc * acc
+            inner = sqrt_2_over_pi * (acc + 0.044715 * acc_cubed)
+            tanh_inner = tl.libdevice.tanh(inner)
+            gelu_out = 0.5 * acc * (1.0 + tanh_inner)
+        else:
+            gelu_out = 0.5 * acc * (1.0 + tl.libdevice.erf(acc * 0.7071067811865476))
+        
+        out_ptrs = output_ptr + offs_m[:, None] * N + offs_n[None, :]
+        tl.store(out_ptrs, gelu_out.to(output_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_n[None, :])
+
+    @triton.autotune(
+        configs=[
+            triton.Config({'BLOCK_SIZE': 256}, num_warps=4),
+            triton.Config({'BLOCK_SIZE': 512}, num_warps=8),
+            triton.Config({'BLOCK_SIZE': 128}, num_warps=2),
+            triton.Config({'BLOCK_SIZE': 1024}, num_warps=8),
+        ],
+        key=['hidden_dim'],
+    )
     @triton.jit
     def modulate_kernel(
         x_ptr, mod_params_ptr, output_ptr, gate_ptr,
@@ -65,57 +100,97 @@ if TRITON_AVAILABLE and USE_TRITON_FUSION:
         BLOCK_SIZE: tl.constexpr,
     ):
         row_idx = tl.program_id(0)
+        col_idx = tl.program_id(1)
         
         if row_idx >= total_rows:
             return
         
         row_start = row_idx * hidden_dim
-        num_blocks = hidden_dim // BLOCK_SIZE
+        h_idx = col_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         
-        for block_idx in range(num_blocks):
-            h_idx = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-            base_offset = row_start + h_idx
-            
-            x = tl.load(x_ptr + base_offset)
-            shift = tl.load(mod_params_ptr + h_idx)
-            scale = tl.load(mod_params_ptr + hidden_dim + h_idx)
-            gate = tl.load(mod_params_ptr + 2 * hidden_dim + h_idx)
-            
-            scale_plus_1 = scale + 1.0
-            output = tl.fma(x, scale_plus_1, shift)
-            
-            tl.store(output_ptr + base_offset, output)
-            tl.store(gate_ptr + base_offset, gate)
+        mask = h_idx < hidden_dim
+        base_offset = row_start + h_idx
+        
+        x = tl.load(x_ptr + base_offset, mask=mask, other=0.0)
+        shift = tl.load(mod_params_ptr + h_idx, mask=mask, other=0.0)
+        scale = tl.load(mod_params_ptr + hidden_dim + h_idx, mask=mask, other=0.0)
+        gate = tl.load(mod_params_ptr + 2 * hidden_dim + h_idx, mask=mask, other=0.0)
+        
+        scale_plus_1 = scale + 1.0
+        output = tl.fma(x, scale_plus_1, shift)
+        
+        tl.store(output_ptr + base_offset, output, mask=mask)
+        tl.store(gate_ptr + base_offset, gate, mask=mask)
 
+    @triton.autotune(
+        configs=[
+            triton.Config({'BLOCK_SIZE': 256}, num_warps=4),
+            triton.Config({'BLOCK_SIZE': 512}, num_warps=8),
+            triton.Config({'BLOCK_SIZE': 128}, num_warps=2),
+        ],
+        key=['hidden_dim'],
+    )
     @triton.jit
-    def fused_norm_modulate_kernel(
+    def fused_norm_modulate_kernel_optimized(
         x_ptr, mod_params_ptr, output_ptr, gate_ptr,
         total_rows, hidden_dim,
         eps: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
+        USE_BF16_ACCUM: tl.constexpr,
     ):
+        """
+        Single-pass fused LayerNorm + Modulate kernel.
+        Each thread block processes one complete row (token).
+        Optimized for hidden_dim=3072 on AMD MI300X.
+        """
         row_idx = tl.program_id(0)
         
         if row_idx >= total_rows:
             return
         
         row_start = row_idx * hidden_dim
-        num_blocks = hidden_dim // BLOCK_SIZE
         hidden_dim_float = tl.cast(hidden_dim, tl.float32)
         
-        mean_acc = 0.0
-        m2_acc = 0.0
+        # Phase 1: Compute statistics with optimized reduction
+        # Process in chunks to improve cache locality
+        num_blocks = hidden_dim // BLOCK_SIZE
         
+        if USE_BF16_ACCUM:
+            # Use BF16 for intermediate accumulation (faster but less precise)
+            mean_acc = tl.zeros([1], dtype=tl.bfloat16)
+            m2_acc = tl.zeros([1], dtype=tl.bfloat16)
+        else:
+            # Use FP32 for accumulation (more precise)
+            mean_acc = 0.0
+            m2_acc = 0.0
+        
+        # Unrolled reduction loop for better performance
         for block_idx in range(num_blocks):
             h_idx = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-            x_vals = tl.load(x_ptr + row_start + h_idx).to(tl.float32)
-            mean_acc += tl.sum(x_vals)
-            m2_acc += tl.sum(x_vals * x_vals)
+            x_vals = tl.load(x_ptr + row_start + h_idx)
+            
+            if USE_BF16_ACCUM:
+                x_bf16 = x_vals.to(tl.bfloat16)
+                mean_acc += tl.sum(x_bf16)
+                m2_acc += tl.sum(x_bf16 * x_bf16)
+            else:
+                x_f32 = x_vals.to(tl.float32)
+                mean_acc += tl.sum(x_f32)
+                m2_acc += tl.sum(x_f32 * x_f32)
         
-        mean = mean_acc / hidden_dim_float
-        variance = m2_acc / hidden_dim_float - mean * mean
+        # Convert to FP32 for final statistics
+        if USE_BF16_ACCUM:
+            mean_acc_f32 = mean_acc.to(tl.float32)
+            m2_acc_f32 = m2_acc.to(tl.float32)
+        else:
+            mean_acc_f32 = mean_acc
+            m2_acc_f32 = m2_acc
+        
+        mean = mean_acc_f32 / hidden_dim_float
+        variance = m2_acc_f32 / hidden_dim_float - mean * mean
         rstd = 1.0 / tl.sqrt(variance + eps)
         
+        # Phase 2: Apply normalization and modulation
         for block_idx in range(num_blocks):
             h_idx = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
             
@@ -124,7 +199,8 @@ if TRITON_AVAILABLE and USE_TRITON_FUSION:
             scale = tl.load(mod_params_ptr + hidden_dim + h_idx).to(tl.float32)
             gate = tl.load(mod_params_ptr + 2 * hidden_dim + h_idx).to(tl.float32)
             
-            x_normalized = tl.fma(x_vals - mean, rstd, 0.0)
+            # Fused normalization and modulation
+            x_normalized = (x_vals - mean) * rstd
             output = tl.fma(x_normalized, scale + 1.0, shift)
             
             tl.store(output_ptr + row_start + h_idx, output.to(x_ptr.dtype.element_ty))
@@ -140,15 +216,15 @@ if TRITON_AVAILABLE and USE_TRITON_FUSION:
         gate = torch.empty_like(x_2d)
         
         total_rows = x_2d.shape[0]
+        USE_BF16_ACCUM = os.environ.get("QWEN_USE_BF16_ACCUM", "0") == "1"
         
-        BLOCK_SIZE = 256 if hidden_dim % 256 == 0 else 128
         grid = (total_rows,)
         
-        fused_norm_modulate_kernel[grid](
+        fused_norm_modulate_kernel_optimized[grid](
             x_2d, mod_params_2d, output, gate,
             total_rows, hidden_dim,
             eps=eps,
-            BLOCK_SIZE=BLOCK_SIZE,
+            USE_BF16_ACCUM=USE_BF16_ACCUM,
         )
         
         return output.view(batch, seq_len, hidden_dim), gate.view(batch, seq_len, hidden_dim)
@@ -163,17 +239,45 @@ if TRITON_AVAILABLE and USE_TRITON_FUSION:
         gate = torch.empty_like(x_2d)
         
         total_rows = x_2d.shape[0]
+        num_col_blocks = triton.cdiv(hidden_dim, 256)
         
-        BLOCK_SIZE = 256 if hidden_dim % 256 == 0 else 128
-        grid = (total_rows,)
+        grid = (total_rows, num_col_blocks)
         
         modulate_kernel[grid](
             x_2d, mod_params_2d, output, gate,
             total_rows, hidden_dim,
-            BLOCK_SIZE=BLOCK_SIZE,
         )
         
         return output.view(batch, seq_len, hidden_dim), gate.view(batch, seq_len, hidden_dim)
+
+    def triton_fused_linear_gelu(x, weight, bias, use_tanh_approx=True):
+        batch, seq_len, in_features = x.shape
+        out_features = weight.shape[0]
+        
+        x_2d = x.reshape(-1, in_features).contiguous()
+        weight = weight.contiguous()
+        bias = bias.contiguous()
+        
+        M = x_2d.shape[0]
+        K = in_features
+        N = out_features
+        
+        output = torch.empty((M, N), dtype=x.dtype, device=x.device)
+        
+        grid = lambda meta: (
+            triton.cdiv(M, meta['BLOCK_M']),
+            triton.cdiv(N, meta['BLOCK_N']),
+        )
+        
+        fused_linear_gelu_kernel[grid](
+            x_2d, weight, bias, output,
+            M, K, N,
+            x_2d.stride(0), x_2d.stride(1),
+            weight.stride(0), weight.stride(1),
+            USE_TANH_APPROX=use_tanh_approx,
+        )
+        
+        return output.view(batch, seq_len, out_features)
 
 class GELU(nn.Module):
     def __init__(self, dim_in: int, dim_out: int, approximate: str = "none", bias: bool = True, dtype=None, device=None, operations=None):
@@ -182,6 +286,18 @@ class GELU(nn.Module):
         self.approximate = approximate
 
     def forward(self, hidden_states):
+        if USE_TRITON_FUSION and TRITON_AVAILABLE and hidden_states.is_cuda:
+            try:
+                use_tanh = self.approximate == "tanh"
+                return triton_fused_linear_gelu(
+                    hidden_states, 
+                    self.proj.weight, 
+                    self.proj.bias,
+                    use_tanh_approx=use_tanh
+                )
+            except:
+                pass
+        
         hidden_states = self.proj(hidden_states)
         hidden_states = F.gelu(hidden_states, approximate=self.approximate)
         return hidden_states
@@ -400,7 +516,6 @@ class QwenImageTransformerBlock(nn.Module):
         x_normed = norm_fn(x)
         return self._modulate(x_normed, mod_params)
 
-    @timing_decorator
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -512,6 +627,10 @@ class QwenImageTransformer2DModel(nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
+        
+        self._forward_count = 0
+        self._profiler = None
+        self._profiler_enabled = USE_PROFILER
 
         self.pe_embedder = EmbedND(dim=attention_head_dim, theta=10000, axes_dim=list(axes_dims_rope))
 
@@ -582,6 +701,36 @@ class QwenImageTransformer2DModel(nn.Module):
         control=None,
         **kwargs
     ):
+        self._forward_count += 1
+        
+        if self._profiler_enabled:
+            if self._forward_count == 10:
+                print("[PROFILER] Starting profiler at forward #10")
+                self._profiler = torch.profiler.profile(
+                    activities=[
+                        torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CUDA,
+                    ],
+                    record_shapes=True,
+                    profile_memory=True,
+                    with_stack=True,
+                )
+                self._profiler.__enter__()
+            elif self._forward_count == 20:
+                if self._profiler is not None:
+                    self._profiler.__exit__(None, None, None)
+                    print("[PROFILER] Stopped profiler at forward #20")
+                    print("\n" + "="*80)
+                    print("Profiler Summary (by CUDA time)")
+                    print("="*80)
+                    print(self._profiler.key_averages().table(sort_by="cuda_time_total", row_limit=20))
+                    
+                    trace_file = "qwen_image_trace.json"
+                    self._profiler.export_chrome_trace(trace_file)
+                    print(f"\n[PROFILER] Trace saved to {trace_file}")
+                    print("="*80 + "\n")
+                    self._profiler = None
+        
         timestep = timesteps
         encoder_hidden_states = context
         encoder_hidden_states_mask = attention_mask
